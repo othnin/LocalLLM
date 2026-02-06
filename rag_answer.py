@@ -1,5 +1,8 @@
 import sys
 import ollama
+from pathlib import Path
+import yaml
+
 from llama_index.core import (
     StorageContext,
     Settings,
@@ -7,129 +10,19 @@ from llama_index.core import (
 )
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
+
 # ================= CONFIG =================
 INDEX_DIR = "/home/achilles/Dev/index"
 EMBED_MODEL = "nomic-ai/nomic-embed-text-v1"
 OLLAMA_MODEL = "qwen2.5-coder:7b"
 TOP_K = 6
+ASSUMPTIONS_DIR = Path("assumptions")
 # ==========================================
 
 _INDEX = None
 
 
-
-def score_retrieval_confidence(nodes):
-    if not nodes:
-        return 0.0
-
-    scores = []
-    files = set()
-
-    for n in nodes:
-        if hasattr(n, "score") and n.score is not None:
-            scores.append(n.score)
-        meta = n.node.metadata
-        files.add(meta.get("file_path", "unknown"))
-
-    avg_score = sum(scores) / len(scores) if scores else 0.0
-    file_focus = 1 / len(files) if files else 0.0
-
-    # Weighted heuristic
-    confidence = (avg_score * 0.7) + (file_focus * 0.3)
-    return round(confidence, 2)
-
-
-def detect_question_type(query: str):
-    q = query.lower()
-
-    signals = {
-        "architecture": [
-            "how does", "flow", "architecture", "end to end",
-            "interaction", "lifecycle", "from backend", "to frontend"
-        ],
-        "bug": [
-            "bug", "error", "exception", "fails",
-            "not working", "traceback", "why is"
-        ],
-        "refactor": [
-            "refactor", "clean up", "improve",
-            "optimize", "rewrite", "better way"
-        ],
-    }
-
-    scores = {}
-    for intent, keywords in signals.items():
-        scores[intent] = sum(1 for k in keywords if k in q)
-
-    total_hits = sum(scores.values())
-    best_intent = max(scores, key=scores.get)
-    best_score = scores[best_intent]
-
-    if total_hits == 0:
-        return {
-            "intent": "ambiguous",
-            "confidence": 0.0,
-            "reason": "No intent keywords matched"
-        }
-
-    confidence = best_score / total_hits
-
-    if confidence < 0.5:
-        return {
-            "intent": "ambiguous",
-            "confidence": round(confidence, 2),
-            "reason": "Multiple intents detected"
-        }
-
-    return {
-        "intent": best_intent,
-        "confidence": round(confidence, 2),
-        "reason": None
-    }
-
-
-def build_clarifying_prompt(query, nodes):
-    return f"""
-        You are unsure you fully understand the user's intent or lack sufficient evidence.
-
-        DO NOT answer the question yet.
-
-        Instead:
-        - Identify what is ambiguous
-        - Ask 1–2 clarifying questions
-        - Explain briefly why clarification is needed
-
-        Original question:
-        {query}
-
-        Relevant code snippets:
-        {format_context(nodes)}
-
-        Respond ONLY with clarifying questions.
-        """
-
-def add_uncertainty_header(confidence):
-    if confidence > 0.7:
-        return ""
-    return (
-        "⚠️ **Confidence Notice**:\n"
-        "This answer is based on partial evidence from the codebase. "
-        "Some assumptions may be incomplete.\n\n"
-    )
-
-
-def should_ask_clarifying_question(
-    intent_confidence: float,
-    retrieval_confidence: float
-):
-    if intent_confidence < 0.5:
-        return True
-    if retrieval_confidence < 0.35:
-        return True
-    return False
-
-
-# ---------- Index + Retrieval ----------
+# ---------- Index Handling ----------
 
 def get_index():
     global _INDEX
@@ -158,116 +51,224 @@ def retrieve_context(query: str):
     return response.source_nodes
 
 
+# ---------- Intent Detection ----------
 
-# ---------- Prompt Helpers ----------
+def detect_question_type(query: str):
+    q = query.lower()
+
+    signals = {
+        "architecture": [
+            "how does", "flow", "architecture", "end to end",
+            "interaction", "lifecycle", "from backend", "to frontend"
+        ],
+        "bug": [
+            "bug", "error", "exception", "fails",
+            "not working", "traceback", "why is"
+        ],
+        "refactor": [
+            "refactor", "clean up", "improve",
+            "optimize", "rewrite", "better way"
+        ],
+    }
+
+    scores = {k: 0 for k in signals}
+
+    for intent, keywords in signals.items():
+        scores[intent] = sum(1 for k in keywords if k in q)
+
+    total = sum(scores.values())
+
+    if total == 0:
+        return {
+            "intent": "ambiguous",
+            "confidence": 0.0,
+            "reason": "No intent keywords matched"
+        }
+
+    best_intent = max(scores, key=scores.get)
+    confidence = scores[best_intent] / total
+
+    if confidence < 0.5:
+        return {
+            "intent": "ambiguous",
+            "confidence": round(confidence, 2),
+            "reason": "Multiple intents detected"
+        }
+
+    return {
+        "intent": best_intent,
+        "confidence": round(confidence, 2),
+        "reason": None
+    }
+
+
+# ---------- Retrieval Confidence ----------
+
+def score_retrieval_confidence(nodes):
+    if not nodes:
+        return 0.0
+
+    scores = []
+    files = set()
+
+    for n in nodes:
+        if hasattr(n, "score") and n.score is not None:
+            scores.append(n.score)
+        files.add(n.node.metadata.get("file_path", "unknown"))
+
+    avg_score = sum(scores) / len(scores) if scores else 0.0
+    file_focus = 1 / len(files) if files else 0.0
+
+    return round((avg_score * 0.7) + (file_focus * 0.3), 2)
+
+
+# ---------- Assumptions (Config-driven) ----------
+
+def load_assumptions(intent: str):
+    path = ASSUMPTIONS_DIR / f"{intent}.yaml"
+    if not path.exists():
+        return []
+
+    with open(path) as f:
+        data = yaml.safe_load(f)
+
+    return data.get("assumptions", [])
+
+
+def evaluate_assumptions(nodes, assumptions):
+    evidence_text = " ".join(n.node.text.lower() for n in nodes)
+    failed = []
+
+    for a in assumptions:
+        if not any(h in evidence_text for h in a["evidence_hints"]):
+            failed.append(a["description"])
+
+    return failed
+
+
+def adjust_confidence(base, failed):
+    penalty = 0.15 * len(failed)
+    return max(0.0, round(base - penalty, 2))
+
+
+# ---------- Prompt Builders ----------
 
 def format_context(nodes):
     blocks = []
-    for node in nodes:
-        meta = node.node.metadata
-        path = meta.get("file_path", "unknown")
-        text = node.node.text.strip()
-        blocks.append(f"FILE: {path}\n{text}")
+    for n in nodes:
+        path = n.node.metadata.get("file_path", "unknown")
+        blocks.append(f"FILE: {path}\n{n.node.text.strip()}")
     return "\n\n".join(blocks)
 
 
 def build_architecture_prompt(query, nodes):
     return f"""
-You are a senior software architect onboarding to an unfamiliar codebase.
+        You are a senior software architect.
 
-Your goal is to explain system behavior and architecture.
+        Explain system behavior using ONLY the provided code.
 
-When answering:
-1. Identify the entry point (request, event, user action)
-2. Trace control flow across layers
-3. Explain responsibility boundaries
-4. Describe backend ↔ frontend interaction
-5. Mention key files only when they clarify the flow
+        Rules:
+        - Trace execution flow
+        - Explain boundaries and responsibilities
+        - Do NOT assume missing components
 
-Do NOT:
-- Restate code line-by-line
-- Speculate beyond the provided code
+        QUESTION:
+        {query}
 
-QUESTION:
-{query}
-
-CODE CONTEXT:
-{format_context(nodes)}
-
-Provide a clear, end-to-end explanation.
-"""
+        CODE:
+        {format_context(nodes)}
+        """
 
 
 def build_bug_prompt(query, nodes):
     return f"""
-You are a senior engineer debugging a production issue.
+        You are debugging a production issue.
 
-Your task:
-- Identify the most likely root cause
-- Explain why the behavior occurs
-- Suggest a fix grounded in the code
+        Identify root cause using ONLY the provided code.
 
-When answering:
-1. Identify where the failure originates
-2. Trace how the bug propagates
-3. Explain incorrect assumptions
-4. Propose a concrete fix
+        QUESTION:
+        {query}
 
-Do NOT:
-- Guess without evidence
-- Suggest unrelated changes
-
-QUESTION:
-{query}
-
-CODE CONTEXT:
-{format_context(nodes)}
-
-Analyze the bug step-by-step.
-"""
+        CODE:
+        {format_context(nodes)}
+        """
 
 
 def build_refactor_prompt(query, nodes):
     return f"""
-You are a senior engineer reviewing code quality and design.
+        You are reviewing code quality.
 
-Your task:
-- Identify structural improvements
-- Explain why the current design is suboptimal
-- Suggest refactors that improve clarity and maintainability
+        Propose refactors justified by the provided code.
 
-When answering:
-1. Identify problematic patterns
-2. Explain risks or limitations
-3. Propose specific refactors
-4. Explain tradeoffs
+        QUESTION:
+        {query}
 
-Do NOT:
-- Rewrite everything
-- Focus on micro-optimizations
-
-QUESTION:
-{query}
-
-CODE CONTEXT:
-{format_context(nodes)}
-
-Provide actionable refactoring advice.
-"""
+        CODE:
+        {format_context(nodes)}
+        """
 
 
 def build_general_prompt(query, nodes):
     return f"""
-You are a senior software engineer answering a question about a codebase.
+        Answer the question using ONLY the code below.
 
-QUESTION:
-{query}
+        QUESTION:
+        {query}
 
-CODE CONTEXT:
-{format_context(nodes)}
+        CODE:
+        {format_context(nodes)}
+        """
 
-Answer clearly and concisely.
-"""
+
+def build_clarifying_prompt(query, nodes):
+    return f"""
+        The intent or evidence is unclear.
+
+        Ask 1–2 clarifying questions instead of answering.
+
+        QUESTION:
+        {query}
+
+        CODE:
+        {format_context(nodes)}
+        """
+
+
+# ---------- Notices ----------
+
+def confidence_notice(confidence):
+    if confidence >= 0.75:
+        return ""
+
+    if confidence >= 0.5:
+        return (
+            "⚠️ **Confidence Notice**:\n"
+            "The retrieved code covers some relevant components, "
+            "but does not show a complete end-to-end flow.\n\n"
+        )
+
+    if confidence >= 0.35:
+        return (
+            "⚠️ **Low Confidence**:\n"
+            "Relevant code exists, but evidence is fragmented or incomplete.\n\n"
+        )
+
+    return (
+        "❌ **Insufficient Evidence**:\n"
+        "The codebase does not support a reliable answer.\n\n"
+    )
+
+
+def assumption_notice(failed):
+    if not failed:
+        return ""
+
+    items = "\n".join(f"- {f}" for f in failed)
+    return (
+        "⚠️ **Unverified Assumptions**:\n"
+        "The following claims are not directly supported by the code:\n"
+        f"{items}\n\n"
+    )
 
 
 # ---------- Main ----------
@@ -276,40 +277,60 @@ def main(query: str):
     print("🔍 Retrieving relevant code...")
     nodes = retrieve_context(query)
 
-
     intent_info = detect_question_type(query)
+
+    # Defensive normalization
+    if isinstance(intent_info, str):
+        intent_info = {
+            "intent": intent_info,
+            "confidence": 1.0,
+            "reason": "legacy return"
+        }
+
     intent = intent_info["intent"]
     intent_conf = intent_info["confidence"]
+
     retrieval_conf = score_retrieval_confidence(nodes)
 
-    print(f"🧠 Intent: {intent} (confidence {intent_conf})")
-    print(f"📚 Evidence confidence: {retrieval_conf}")
+    assumptions = load_assumptions(intent)
+    failed_assumptions = evaluate_assumptions(nodes, assumptions)
 
-    if should_ask_clarifying_question(intent_conf, retrieval_conf):
+    final_conf = adjust_confidence(retrieval_conf, failed_assumptions)
+
+    print(f"🧠 Intent: {intent} (confidence {intent_conf})")
+    print(f"📚 Evidence confidence: {final_conf}")
+
+    # Hard refusal
+    if final_conf < 0.35:
+        print(confidence_notice(final_conf))
+        print("❓ Not enough evidence. Please clarify or point to relevant files.")
+        return
+
+    # Clarify if intent ambiguous
+    if intent == "ambiguous":
         prompt = build_clarifying_prompt(query, nodes)
+    elif intent == "architecture":
+        prompt = build_architecture_prompt(query, nodes)
+    elif intent == "bug":
+        prompt = build_bug_prompt(query, nodes)
+    elif intent == "refactor":
+        prompt = build_refactor_prompt(query, nodes)
     else:
-        if intent == "architecture":
-            prompt = build_architecture_prompt(query, nodes)
-        elif intent == "bug":
-            prompt = build_bug_prompt(query, nodes)
-        elif intent == "refactor":
-            prompt = build_refactor_prompt(query, nodes)
-        else:
-            prompt = build_general_prompt(query, nodes)
+        prompt = build_general_prompt(query, nodes)
 
     response = ollama.chat(
         model=OLLAMA_MODEL,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    answer = response["message"]["content"]
-    header = add_uncertainty_header(retrieval_conf)
+    print()
+    print(confidence_notice(final_conf) + assumption_notice(failed_assumptions))
+    print(response["message"]["content"])
 
-    print(header + answer)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python rag_answer.py \"your question here\"")
+        print("Usage: python rag_answer.py \"your question\"")
         sys.exit(1)
 
     main(sys.argv[1])

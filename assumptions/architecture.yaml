@@ -1,0 +1,24 @@
+assumptions:
+  - key: frontend_auth_usage
+    description: Frontend sends or enforces authentication credentials
+    evidence_hints:
+      - frontend
+      - client
+      - authorization
+      - bearer
+      - token
+
+  - key: api_boundary_auth
+    description: Authentication is validated at the API or middleware boundary
+    evidence_hints:
+      - middleware
+      - auth
+      - guard
+      - request
+
+  - key: shared_auth_contract
+    description: Frontend and backend share an authentication contract (JWT/session)
+    evidence_hints:
+      - authorization
+      - cookie
+      - jwt

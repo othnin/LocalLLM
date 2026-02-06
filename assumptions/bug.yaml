@@ -1,0 +1,14 @@
+assumptions:
+  - key: reproducible_failure
+    description: The error is deterministic and reproducible
+    evidence_hints:
+      - traceback
+      - exception
+      - error
+
+  - key: code_path_executed
+    description: The failing code path is actually executed
+    evidence_hints:
+      - called
+      - invoked
+      - handler

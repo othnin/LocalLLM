@@ -1,0 +1,40 @@
+assumptions:
+  - key: duplicated_logic
+    description: The same logic is duplicated across multiple locations
+    evidence_hints:
+      - duplicated
+      - copy
+      - same logic
+      - repeated
+
+  - key: unclear_responsibilities
+    description: Responsibilities are mixed or poorly separated
+    evidence_hints:
+      - util
+      - helper
+      - common
+      - manager
+
+  - key: tight_coupling
+    description: Components are tightly coupled or depend on concrete implementations
+    evidence_hints:
+      - import
+      - dependency
+      - directly uses
+      - instantiates
+
+  - key: complex_function
+    description: Functions or methods are overly complex
+    evidence_hints:
+      - TODO
+      - FIXME
+      - hack
+      - workaround
+
+  - key: missing_abstractions
+    description: Abstractions or interfaces are missing where multiple implementations exist
+    evidence_hints:
+      - if
+      - else
+      - switch
+      - case
